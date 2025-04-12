@@ -243,13 +243,19 @@
         try {
           video = document.getElementById("video");
 
-          // Load BodyPix model
-          updateStatus("Loading BodyPix model...");
+          // Load BodyPix model with advanced options
+          updateStatus("Loading TensorFlow.js and BodyPix...");
+          // Set tf memory options for better performance
+          tf.env().set("WEBGL_CPU_FORWARD", false);
+          tf.env().set("WEBGL_PACK", true);
+
+          // Load BodyPix model with more advanced options
           bodyPixModel = await bodyPix.load({
-            architecture: "MobileNetV1",
+            architecture: "ResNet50", // Use more powerful architecture
             outputStride: 16,
-            multiplier: 0.75,
-            quantBytes: 2,
+            quantBytes: 4, // Use higher precision
+            modelUrl:
+              "https://storage.googleapis.com/tfjs-models/savedmodel/bodypix/resnet50/float/model-stride16.json",
           });
 
           updateStatus("Models loaded. Click 'Start Camera' to begin.");
@@ -349,7 +355,6 @@
         startCamera();
       }
 
-      // Capture image
       async function captureImage() {
         if (!streaming || !bodyPixModel) {
           updateStatus("Camera not active or model not loaded.");
@@ -359,22 +364,51 @@
         try {
           updateStatus("Processing image...");
 
-          // Segment person from background
-          const segmentation = await bodyPixModel.segmentPerson(video, {
+          // Show a loading indicator for better UX
+          loadingElement.classList.remove("hidden");
+          document.getElementById("loading-text").textContent =
+            "Capturing professional headshot...";
+
+          // Use higher-quality segmentation with more advanced options
+          const segmentationConfig = {
             flipHorizontal: false,
-            internalResolution: "medium",
+            internalResolution: "high",
             segmentationThreshold: 0.7,
-          });
+            maxDetections: 1,
+            scoreThreshold: 0.4,
+            nmsRadius: 20,
+            minKeypointScore: 0.3,
+            refineSteps: 10,
+          };
 
-          // Process image and show result
-          processImage(segmentation);
-          capturedImageData = segmentation;
-          downloadButton.disabled = false;
+          // Do segmentation with a small delay to allow UI to update
+          setTimeout(async () => {
+            try {
+              // Segment person from background
+              const segmentation = await bodyPixModel.segmentPerson(
+                video,
+                segmentationConfig
+              );
 
-          updateStatus("Headshot captured! You can download it or try again.");
+              // Process image and show result
+              processImage(segmentation);
+              capturedImageData = segmentation;
+              downloadButton.disabled = false;
+
+              updateStatus(
+                "Headshot captured! You can download it or try again."
+              );
+              loadingElement.classList.add("hidden");
+            } catch (error) {
+              console.error("Error in segmentation:", error);
+              updateStatus("Error processing image: " + error.message);
+              loadingElement.classList.add("hidden");
+            }
+          }, 100);
         } catch (error) {
           console.error("Error capturing image:", error);
           updateStatus("Error processing image: " + error.message);
+          loadingElement.classList.add("hidden");
         }
       }
 
@@ -390,129 +424,305 @@
         // Draw background based on selected style
         drawBackground(ctx, width, height, selectedBackground);
 
-        // Create a temporary canvas to handle the person segmentation
-        const tempCanvas = document.createElement("canvas");
-        tempCanvas.width = width;
-        tempCanvas.height = height;
-        const tempCtx = tempCanvas.getContext("2d");
+        // Create a temporary canvas for the person
+        const personCanvas = document.createElement("canvas");
+        personCanvas.width = width;
+        personCanvas.height = height;
+        const personCtx = personCanvas.getContext("2d");
 
-        // Draw the original video frame to the temporary canvas
-        if (facingMode === "user") {
-          // Mirror the image for selfie mode
-          tempCtx.translate(width, 0);
-          tempCtx.scale(-1, 1);
-        }
-        tempCtx.drawImage(video, 0, 0, width, height);
+        // Draw the original video frame
+        personCtx.drawImage(video, 0, 0, width, height);
 
-        // Get the image data from the temporary canvas
-        const imageData = tempCtx.getImageData(0, 0, width, height);
+        // Create a refined mask by smoothing the edges
+        const maskCanvas = document.createElement("canvas");
+        maskCanvas.width = width;
+        maskCanvas.height = height;
+        const maskCtx = maskCanvas.getContext("2d");
 
-        // Apply the segmentation mask
-        const maskData = new ImageData(width, height);
+        // Create binary mask from segmentation
+        const maskImageData = maskCtx.createImageData(width, height);
+        const maskData = maskImageData.data;
+
+        // Convert segmentation to rgba mask with anti-aliased edges
         for (let i = 0; i < segmentation.data.length; i++) {
-          // For each pixel, check if it's part of a person
+          // Pixel index in ImageData array (4 values per pixel - r,g,b,a)
           const j = i * 4;
+
           if (segmentation.data[i] === 1) {
-            // This pixel is part of a person
-            maskData.data[j] = imageData.data[j]; // R
-            maskData.data[j + 1] = imageData.data[j + 1]; // G
-            maskData.data[j + 2] = imageData.data[j + 2]; // B
-            maskData.data[j + 3] = 255; // A (fully opaque)
+            // Person pixel - fully opaque white
+            maskData[j] = 255;
+            maskData[j + 1] = 255;
+            maskData[j + 2] = 255;
+            maskData[j + 3] = 255;
+          } else {
+            // Background pixel - fully transparent
+            maskData[j] = 0;
+            maskData[j + 1] = 0;
+            maskData[j + 2] = 0;
+            maskData[j + 3] = 0;
           }
-          // Otherwise, leave the pixel transparent (it's already 0)
         }
 
-        // Put the masked person image on top of the background
-        ctx.putImageData(maskData, 0, 0);
+        maskCtx.putImageData(maskImageData, 0, 0);
 
-        // Apply some enhancement filters
+        // Apply a blur to the mask to smooth edges
+        maskCtx.filter = "blur(2px)";
+        maskCtx.globalCompositeOperation = "source-over";
+        maskCtx.drawImage(maskCanvas, 0, 0);
+
+        // Reset filter
+        maskCtx.filter = "none";
+
+        // Apply the mask to the person image
+        personCtx.globalCompositeOperation = "destination-in";
+        personCtx.drawImage(maskCanvas, 0, 0);
+
+        // Now draw the person onto the output canvas
+        if (facingMode === "user") {
+          // Flip horizontally for selfie mode
+          ctx.save();
+          ctx.translate(width, 0);
+          ctx.scale(-1, 1);
+          ctx.drawImage(personCanvas, 0, 0);
+          ctx.restore();
+        } else {
+          ctx.drawImage(personCanvas, 0, 0);
+        }
+
+        // Apply professional photo enhancements
         enhanceImage(ctx, width, height);
       }
 
       // Draw different background styles
       function drawBackground(ctx, width, height, style) {
+        ctx.save();
+
+        // First clear the canvas
+        ctx.clearRect(0, 0, width, height);
+
         switch (style) {
           case "gradient-1":
+            // Professional light blue gradient (popular for LinkedIn headshots)
             const gradient1 = ctx.createLinearGradient(0, 0, width, height);
             gradient1.addColorStop(0, "#2193b0");
             gradient1.addColorStop(1, "#6dd5ed");
             ctx.fillStyle = gradient1;
             break;
           case "gradient-2":
+            // Professional dark blue gradient
             const gradient2 = ctx.createLinearGradient(0, 0, width, height);
-            gradient2.addColorStop(0, "#373B44");
+            gradient2.addColorStop(0, "#2c3e50");
             gradient2.addColorStop(1, "#4286f4");
             ctx.fillStyle = gradient2;
             break;
           case "gradient-3":
+            // Professional purple gradient
             const gradient3 = ctx.createLinearGradient(0, 0, width, height);
-            gradient3.addColorStop(0, "#8e2de2");
-            gradient3.addColorStop(1, "#4a00e0");
+            gradient3.addColorStop(0, "#8e44ad");
+            gradient3.addColorStop(1, "#9b59b6");
             ctx.fillStyle = gradient3;
             break;
           case "solid-1":
-            ctx.fillStyle = "#333333";
+            // Classic dark background (popular for executive headshots)
+            ctx.fillStyle = "#2c3e50";
             break;
           case "solid-2":
+            // Light gray (modern minimal style)
             ctx.fillStyle = "#f5f5f5";
             break;
           default:
             ctx.fillStyle = "#2193b0";
         }
 
+        // Draw the background
         ctx.fillRect(0, 0, width, height);
+
+        // Add subtle background lighting effects for more professional look
+        if (style !== "solid-2") {
+          // Skip for light backgrounds
+          // Add a subtle gradient highlight to simulate studio lighting
+          const lightGradient = ctx.createRadialGradient(
+            width * 0.3,
+            height * 0.2,
+            0,
+            width * 0.3,
+            height * 0.2,
+            width * 0.7
+          );
+
+          lightGradient.addColorStop(0, "rgba(255, 255, 255, 0.1)");
+          lightGradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+
+          ctx.globalCompositeOperation = "screen";
+          ctx.fillStyle = lightGradient;
+          ctx.fillRect(0, 0, width, height);
+
+          // Reset composite operation
+          ctx.globalCompositeOperation = "source-over";
+        }
+
+        ctx.restore();
       }
 
       // Apply image enhancements to make the headshot look more professional
       function enhanceImage(ctx, width, height) {
-        // Get image data
+        // Get image data for pixel manipulation
         const imageData = ctx.getImageData(0, 0, width, height);
         const data = imageData.data;
 
-        // Increase contrast and brightness slightly
+        // Store original image for blending
+        const origCanvas = document.createElement("canvas");
+        origCanvas.width = width;
+        origCanvas.height = height;
+        const origCtx = origCanvas.getContext("2d");
+        origCtx.putImageData(imageData, 0, 0);
+
+        // Apply sophisticated color grading for professional look
         for (let i = 0; i < data.length; i += 4) {
           // Skip transparent pixels
           if (data[i + 3] === 0) continue;
 
-          // Increase contrast slightly
-          data[i] = data[i] * 1.05; // R
-          data[i + 1] = data[i + 1] * 1.05; // G
-          data[i + 2] = data[i + 2] * 1.05; // B
+          // Reduce shadows (brighten dark areas slightly)
+          if (data[i] < 60 && data[i + 1] < 60 && data[i + 2] < 60) {
+            data[i] = Math.min(255, data[i] + 20);
+            data[i + 1] = Math.min(255, data[i + 1] + 15);
+            data[i + 2] = Math.min(255, data[i + 2] + 10);
+          }
 
-          // Subtle warming filter (add slight orange/yellow tint)
-          data[i] = Math.min(255, data[i] + 5); // Add a bit more red
-          data[i + 1] = Math.min(255, data[i + 1] + 3); // Add a bit more green
+          // Professional color grading
+          // Slight boost to mid-tones
+          const avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
+          if (avg > 60 && avg < 180) {
+            const factor = 1.08;
+            data[i] = Math.min(255, data[i] * factor);
+            data[i + 1] = Math.min(255, data[i + 1] * factor);
+            data[i + 2] = Math.min(255, data[i + 2] * factor);
+          }
 
-          // Make sure values stay within 0-255
-          data[i] = Math.min(255, Math.max(0, data[i]));
-          data[i + 1] = Math.min(255, Math.max(0, data[i + 1]));
-          data[i + 2] = Math.min(255, Math.max(0, data[i + 2]));
+          // Slight warming filter (professional headshots often have warm tones)
+          data[i] = Math.min(255, data[i] + 8); // More red
+          data[i + 1] = Math.min(255, data[i + 1] + 4); // Little more green
+
+          // Enhance skin tones
+          if (isLikelySkinTone(data[i], data[i + 1], data[i + 2])) {
+            // Soften skin slightly
+            data[i] = Math.min(255, data[i] * 0.98 + 5);
+            data[i + 1] = Math.min(255, data[i + 1] * 0.98 + 3);
+            data[i + 2] = Math.min(255, data[i + 2] * 0.98 + 2);
+          }
         }
 
         // Put the enhanced image data back
         ctx.putImageData(imageData, 0, 0);
 
-        // Apply a subtle vignette effect (darkened corners)
+        // Apply professional portrait effects
+
+        // 1. Professional vignette (subtle darkening around edges)
         const centerX = width / 2;
         const centerY = height / 2;
-        const maxDistance = Math.sqrt(centerX * centerX + centerY * centerY);
+        const radius = Math.max(width, height) * 0.7;
 
+        ctx.save();
         ctx.globalCompositeOperation = "multiply";
         const gradient = ctx.createRadialGradient(
           centerX,
           centerY,
-          maxDistance * 0.6,
+          radius * 0.5,
           centerX,
           centerY,
-          maxDistance
+          radius
         );
         gradient.addColorStop(0, "rgba(255, 255, 255, 1)");
-        gradient.addColorStop(1, "rgba(200, 200, 200, 1)");
+        gradient.addColorStop(1, "rgba(220, 220, 220, 1)");
         ctx.fillStyle = gradient;
         ctx.fillRect(0, 0, width, height);
+        ctx.restore();
 
-        // Reset composite operation
-        ctx.globalCompositeOperation = "source-over";
+        // 2. Apply subtle clarity/sharpening effect
+        // First create a sharpened version
+        const sharpCanvas = document.createElement("canvas");
+        sharpCanvas.width = width;
+        sharpCanvas.height = height;
+        const sharpCtx = sharpCanvas.getContext("2d");
+
+        // Draw original
+        sharpCtx.drawImage(origCanvas, 0, 0);
+
+        // Apply unsharp mask
+        const sharpData = sharpCtx.getImageData(0, 0, width, height);
+        const sharpPixels = sharpData.data;
+        const tempData = new Uint8ClampedArray(sharpPixels);
+
+        // Simple sharpening by increasing contrast of adjacent pixels
+        for (let y = 1; y < height - 1; y++) {
+          for (let x = 1; x < width - 1; x++) {
+            const idx = (y * width + x) * 4;
+            for (let c = 0; c < 3; c++) {
+              const val = sharpPixels[idx + c] * 5;
+              const neighbors =
+                tempData[idx - width * 4 + c] +
+                tempData[idx + width * 4 + c] +
+                tempData[idx - 4 + c] +
+                tempData[idx + 4 + c];
+
+              sharpPixels[idx + c] =
+                Math.min(
+                  255,
+                  Math.max(0, val - neighbors / 4 + sharpPixels[idx + c])
+                ) / 2;
+            }
+          }
+        }
+
+        sharpCtx.putImageData(sharpData, 0, 0);
+
+        // 3. Blend the sharpened version with the enhanced version
+        ctx.globalAlpha = 0.3;
+        ctx.drawImage(sharpCanvas, 0, 0);
+        ctx.globalAlpha = 1.0;
+
+        // 4. Subtle light effect - top left highlight (studio lighting)
+        ctx.save();
+        ctx.globalCompositeOperation = "screen";
+        const lightGradient = ctx.createRadialGradient(
+          width * 0.3,
+          height * 0.3,
+          0,
+          width * 0.3,
+          height * 0.3,
+          width * 0.6
+        );
+        lightGradient.addColorStop(0, "rgba(255, 255, 255, 0.1)");
+        lightGradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+        ctx.fillStyle = lightGradient;
+        ctx.fillRect(0, 0, width, height);
+        ctx.restore();
+      }
+
+      // Helper function to detect likely skin tones
+      function isLikelySkinTone(r, g, b) {
+        // Simple heuristic for skin tone detection
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+
+        // Check if color is in the "brown" family
+        if (r > g && g > b) {
+          const normalizedR = r / 255;
+          const normalizedG = g / 255;
+          const normalizedB = b / 255;
+
+          // Simplified skin tone detection
+          // Red channel should be higher, green medium, blue lowest
+          if (
+            normalizedR > 0.35 &&
+            normalizedG > 0.2 &&
+            normalizedG < normalizedR &&
+            normalizedB < normalizedG
+          ) {
+            return true;
+          }
+        }
+        return false;
       }
 
       // Download the headshot
